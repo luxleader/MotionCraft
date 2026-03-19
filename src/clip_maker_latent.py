@@ -24,7 +24,9 @@ args.add_argument(
     default="nearest",
 )
 args.add_argument("--device", type=str, default="cuda:0")
-args.add_argument("--tau", type=int, default=400)
+
+args.add_argument("--tau", type=int, default=400)#控制扩散反演的时间步深度
+
 args.add_argument("--num_inference_steps", type=int, default=200)
 args.add_argument("--guidance_scale", type=float, default=7.5)
 args.add_argument(
@@ -60,6 +62,7 @@ single_attention_processor = get_attention_processor(
 cross_attention_processor = get_attention_processor_from_pattern(
     args.crossframeattention_pattern
 )
+#对初始图像进行反演，获取视频生成的基准起点的潜变量
 
 SDM.pipeline.unet.set_attn_processor(single_attention_processor)
 z_tau_orig = image_warper.get_ztau_orig(SDM, num_inference_steps)

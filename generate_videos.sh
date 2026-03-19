@@ -2,7 +2,7 @@
 
 cd src
 
-export CUDA_VISIBLE_DEVICES=9
+export CUDA_VISIBLE_DEVICES=6
 
 # Pixel-Space Experiments
 # for example in "fire"
