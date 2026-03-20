@@ -68,13 +68,14 @@ z_tau_orig = image_warper.get_ztau_orig(SDM, num_inference_steps)
 z_tau = z_tau_orig.clone()
 
 framesteps = image_warper.get_default_framesteps()
-for f, (framestep) in enumerate(tqdm(framesteps)):
+for f, framestep in enumerate(tqdm(framesteps)):
     warped_latent = image_warper.warp(
         t=framestep,
         previous_frame=z_tau,
         original_frame=z_tau_orig,
         mode=args.interpolationmode,
     )
+
     if args.spatialeta:
         spatial_eta = image_warper.get_spatial_eta(t=framestep)
         spatial_eta = spatial_eta.repeat(cross_attention_processor.video_length, 1, 1, 1)
@@ -101,63 +102,46 @@ for f, (framestep) in enumerate(tqdm(framesteps)):
     )
 
     generated_frames = SDM.latent_to_image(generated_latents)
-    
-    # ===================== 方案1：图像级混合 (改进版 - 不需要 cv2) =====================
-    # 检查是否为 FloodFlow（需要保护非洪水区）
-    if hasattr(image_warper, 'flood_seq') and f < len(image_warper.flood_seq):
-        # 获取当前帧的洪水掩码
-        flooded_hard = image_warper.flood_seq[f].to(device)  # (1,1,N,N)
-        
-        # 获取原始图像（初始帧）
+
+    # ===================== FloodFlow：软掩码混合版 =====================
+    if hasattr(image_warper, "flood_seq") and hasattr(image_warper, "get_spatial_eta"):
         original_image_pil = image_warper.get_default_image()
-        
-        # 遍历所有生成的帧进行混合
+
+        soft_mask = image_warper.get_spatial_eta(t=framestep).to(device)
+        hard_mask = image_warper.flood_seq[f].to(device) if f < len(image_warper.flood_seq) else None
+
+        display_mask = torch.clamp(soft_mask * 1.45, 0.0, 1.0)
+        if hard_mask is not None:
+            display_mask = torch.maximum(display_mask, hard_mask * 0.95)
+
         for i, generated_img in enumerate(generated_frames):
-            # 调整原始图像尺寸以匹配生成图像
             if original_image_pil.size != generated_img.size:
                 original_img_resized = original_image_pil.resize(
                     generated_img.size, Image.LANCZOS
                 )
             else:
                 original_img_resized = original_image_pil
-            
-            # 转换为 numpy 数组
-            generated_np = np.array(generated_img)
-            original_np = np.array(original_img_resized)
-            
-            # 获取图像尺寸
+
+            generated_np = np.array(generated_img).astype(np.float32)
+            original_np = np.array(original_img_resized).astype(np.float32)
             H, W = generated_np.shape[:2]
-            
-            # ✅ 使用 PIL 替代 cv2.resize
-            flooded_mask_np = flooded_hard[0, 0].cpu().numpy().astype(np.float32)
-            flooded_mask_pil = Image.fromarray(
-                (flooded_mask_np * 255).astype(np.uint8), mode='L'
-            )
-            flooded_mask_resized_pil = flooded_mask_pil.resize(
-                (W, H), Image.BILINEAR
-            )
-            flooded_mask_resized = np.array(flooded_mask_resized_pil).astype(np.float32) / 255.0
-            
-            # 扩展掩码为 3 通道（RGB）
-            flooded_mask_3d = np.stack(
-                [flooded_mask_resized] * 3, axis=-1
-            )  # (H, W, 3)
-            
-            # 混合图像：洪水区使用生成图像，非洪水区使用原始图像
+
+            display_mask_np = display_mask[0, 0].detach().cpu().numpy().astype(np.float32)
+            display_mask_pil = Image.fromarray((display_mask_np * 255).astype(np.uint8), mode="L")
+            display_mask_resized = np.array(
+                display_mask_pil.resize((W, H), Image.BILINEAR)
+            ).astype(np.float32) / 255.0
+
+            display_mask_resized = np.clip(display_mask_resized * 1.12, 0.0, 1.0)
+            display_mask_3d = np.stack([display_mask_resized] * 3, axis=-1)
+
             blended_np = (
-                generated_np.astype(np.float32) * flooded_mask_3d +
-                original_np.astype(np.float32) * (1 - flooded_mask_3d)
+                generated_np * display_mask_3d
+                + original_np * (1.0 - display_mask_3d)
             ).astype(np.uint8)
-            
-            # 转换回 PIL 图像
-            blended_img = Image.fromarray(blended_np)
-            
-            # 保存混合后的图像
-            blended_img.save(f"{folder_path}/frame_{f:03d}_{i}.png")
-            
-            print(f"  Frame {f:03d}_{i}: 洪水区覆盖率 = {flooded_mask_resized.mean():.2%}")
+
+            Image.fromarray(blended_np).save(f"{folder_path}/frame_{f:03d}_{i}.png")
     else:
-        # 非 FloodFlow 场景，直接保存
         for i, img in enumerate(generated_frames):
             img.save(f"{folder_path}/frame_{f:03d}_{i}.png")
     # =====================================================================

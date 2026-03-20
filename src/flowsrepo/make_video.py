@@ -3,8 +3,8 @@ import glob
 from PIL import Image
 
 # ====== 配置 ======
-input_folder = "../output/MotionCraft_bilinear/1773220406.2896607_flood"
-output_gif = "flood_preview_1.gif"
+input_folder = "../output/MotionCraft_bilinear/1773910806.3558862_flood"
+output_gif = "flood_preview_2.gif"
 duration = 400 # 每帧 200ms = 5fps
 # =================
 

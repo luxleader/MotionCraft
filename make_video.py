@@ -3,9 +3,9 @@ import glob
 from PIL import Image
 
 # ====== 配置 ======
-input_folder = "/home/yangdonglin/MotionCraft/src/output/MotionCraft_bilinear/1773715449.3774574_flood"
-output_gif = "flood_preview_1.gif"
-duration = 400 # 每帧 200ms = 5fps
+input_folder = "/home/yangdonglin/MotionCraft/src/output/MotionCraft_bilinear/1773977205.351142_flood"
+output_gif = "flood_preview_2.gif"
+duration = 200 # 每帧 200ms = 5fps
 # =================
 
 # 寻找所有 _2.png
