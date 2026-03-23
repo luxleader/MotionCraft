@@ -77,12 +77,20 @@ for f, framestep in enumerate(tqdm(framesteps)):
     )
 
     if args.spatialeta:
-        spatial_eta = image_warper.get_spatial_eta(t=framestep)
-        spatial_eta = spatial_eta.repeat(cross_attention_processor.video_length, 1, 1, 1)
+        repaint_mask = image_warper.get_spatial_eta(t=framestep).to(warped_latent.device, warped_latent.dtype)
+
+        # Fix 1: Input isolation — replace the background region of warped_latent
+        # with z_tau_orig before packing z_pair.  This prevents the UNet from
+        # seeing two different background representations across frames, which
+        # would otherwise let background K/V tokens leak into repaint-zone queries
+        # through cross-frame attention.
+        warped_latent = warped_latent * repaint_mask + z_tau_orig * (1.0 - repaint_mask)
+
+        spatial_eta = repaint_mask.repeat(cross_attention_processor.video_length, 1, 1, 1)
         spatial_eta[:-1] = 0.0
-        spatial_eta = spatial_eta.to(warped_latent.device, warped_latent.dtype)
         print(spatial_eta.abs().sum())
     else:
+        repaint_mask = None
         spatial_eta = 0.0
 
     if cross_attention_processor.video_length == 2:
@@ -100,6 +108,17 @@ for f, framestep in enumerate(tqdm(framesteps)):
         guidance_scale=guidance_scale,
         negative_prompt=[prompt] * (len(z_pair) - 1) + [negative_prompt],
     )
+
+    # Fix 2: Output compositing in latent space — guarantee that the background
+    # region of the target frame latent is exactly z_tau_orig, eliminating any
+    # residual influence from the diffusion process or cross-frame attention on
+    # pixels that should not be repainted.
+    if repaint_mask is not None:
+        generated_latents = generated_latents.clone()
+        generated_latents[-1:] = (
+            generated_latents[-1:] * repaint_mask
+            + z_tau_orig * (1.0 - repaint_mask)
+        )
 
     generated_frames = SDM.latent_to_image(generated_latents)
 
