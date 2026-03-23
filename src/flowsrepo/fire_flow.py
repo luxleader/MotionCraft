@@ -287,12 +287,10 @@ class FireFlow(BaseFlow):
 
             coords = XY - flow
 
-            # 严格背景保护：采样源如果落到未燃烧区域，直接锁回原地
-            source_mask = _dilate(burn, self.source_guard_dilate)[0, 0]
-            idx = _coords_to_index(coords, N)
-            valid = source_mask[idx[..., 1], idx[..., 0]]
-            valid = (valid > 0.5).float()[..., None]
-            coords = coords * valid + XY * (1.0 - valid)
+            # 严格背景保护：在坐标生成阶段直接分界，背景区保持恒等映射
+            # adv_mask shape: (N, N)；[..., None] 扩展为 (N, N, 1) 以与 coords/XY (N, N, 2) 广播
+            # 与 FloodFlow 保持一致的早期掩码策略
+            coords = coords * adv_mask[..., None] + XY * (1.0 - adv_mask[..., None])
 
             grid = coords.clone()
             grid[..., 0] = 2.0 * (grid[..., 0] / (N - 1.0)) - 1.0
