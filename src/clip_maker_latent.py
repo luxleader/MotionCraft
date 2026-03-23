@@ -114,10 +114,9 @@ for f, framestep in enumerate(tqdm(framesteps)):
     # residual influence from the diffusion process or cross-frame attention on
     # pixels that should not be repainted.
     if repaint_mask is not None:
-        generated_latents = generated_latents.clone()
-        generated_latents[-1:] = (
-            generated_latents[-1:] * repaint_mask
-            + z_tau_orig * (1.0 - repaint_mask)
+        generated_latents[-1] = (
+            generated_latents[-1].clone() * repaint_mask[0]
+            + z_tau_orig[0] * (1.0 - repaint_mask[0])
         )
 
     generated_frames = SDM.latent_to_image(generated_latents)
