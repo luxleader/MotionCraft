@@ -103,15 +103,19 @@ for f, framestep in enumerate(tqdm(framesteps)):
 
     generated_frames = SDM.latent_to_image(generated_latents)
 
-    # ===================== FloodFlow：软掩码混合版 =====================
-    if hasattr(image_warper, "flood_seq") and hasattr(image_warper, "get_spatial_eta"):
+    # ===================== Mask Blended Version =====================
+    if hasattr(image_warper, "get_spatial_eta"):
         original_image_pil = image_warper.get_default_image()
 
         soft_mask = image_warper.get_spatial_eta(t=framestep).to(device)
-        hard_mask = image_warper.flood_seq[f].to(device) if f < len(image_warper.flood_seq) else None
-
         display_mask = torch.clamp(soft_mask * 1.45, 0.0, 1.0)
-        if hard_mask is not None:
+        
+        # 兼容 FloodFlow 和 FireFlow 的硬掩码
+        if hasattr(image_warper, "flood_seq") and f < len(image_warper.flood_seq):
+            hard_mask = image_warper.flood_seq[f].to(device)
+            display_mask = torch.maximum(display_mask, hard_mask * 0.95)
+        elif hasattr(image_warper, "burn_seq") and f < len(image_warper.burn_seq):
+            hard_mask = image_warper.burn_seq[f].to(device)
             display_mask = torch.maximum(display_mask, hard_mask * 0.95)
 
         for i, generated_img in enumerate(generated_frames):
