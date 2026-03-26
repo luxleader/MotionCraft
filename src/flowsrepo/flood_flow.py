@@ -5,8 +5,27 @@ import torch.nn.functional as F
 import PIL.Image as Image
 from .base_flow import BaseFlow
 
+try:
+    from phi.torch.flow import (
+        Box,
+        CenteredGrid,
+        Solve,
+        StaggeredGrid,
+        advect,
+        diffuse,
+        extrapolation,
+        fluid,
+        math,
+        resample,
+        spatial,
+        field,  # 新增：用于 Field 级别操作
+    )
+    PHIFLOW_AVAILABLE = True
+except ImportError:
+    PHIFLOW_AVAILABLE = False
+
 DEFAULT_IMAGE_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_scene.png"
-DEFAULT_WATER_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_1.png"
+DEFAULT_WATER_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_2.png"
 DEFAULT_REGION_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_region_1.png"
 DEFAULT_SOLID_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/solid_mask.png"
 
@@ -100,6 +119,17 @@ def _partial_zero_mean_flow(dx: torch.Tensor, dy: torch.Tensor, weight: torch.Te
     return dx, dy
 
 
+def _torch_mask_to_phi_grid(mask_2d: torch.Tensor, domain):
+    phi_values = math.tensor(mask_2d.detach().cpu().numpy(), spatial('y,x'))
+    return CenteredGrid(
+        phi_values,
+        extrapolation.BOUNDARY,
+        domain,
+        x=mask_2d.shape[1],
+        y=mask_2d.shape[0],
+    )
+
+
 class FloodFlow(BaseFlow):
     def __init__(
         self,
@@ -108,11 +138,11 @@ class FloodFlow(BaseFlow):
         water_mask_path: str = None,
         region_mask_path: str = None,
         solid_mask_path: str = None,
-        T: int = 48,
+        T: int = 24,
 
         # flooding
         level_start: float = 20.0,
-        level_end: float = 200.0,      # 改回适合 128x128 尺寸的正常最大半径
+        level_end: float = 480.0,      # 改回适合 128x128 尺寸的正常最大半径
         level_ease_pow: float = 1.2,
         eta_band: float = 15.0,        # 减小渐变宽度，让洪水边缘更实、更明显
         eta_gamma: float = 1.15,
@@ -124,34 +154,33 @@ class FloodFlow(BaseFlow):
         front_ring_outer_ratio: float = 1.15,
         front_motion_suppress: float = 0.02,
 
-        # motion
-        downstream_x_px: float = 0.42,
-        downstream_y_px: float = 0.42,
-        curl_px: float = 0.04,
-        sway_px: float = 0.015,
-        edge_slow_pow: float = 1.0,
-        max_disp_px: float = 3.0,
+        # PhiFlow Physics
+        dt: float = 1.0,
+        gravity_x: float = 0.15,
+        gravity_y: float = 0.15,
+        viscosity: float = 0.05,
+        inflow_rate: float = 0.5,
+        water_diffusion: float = 0.01,
 
         # guards
+        max_disp_px: float = 3.0,
         adv_dilate: int = 12,
         source_guard_dilate: int = 5,
         solid_damping: float = 1.0,
 
-        # noise
-        noise_seed: int = 123,
-        noise_smooth_k: int = 9,
-        noise_smooth_iters: int = 2,
-
         # breach point：强制指定起始点位置
         # （假设原图入口在左上角，这里的数字是基于 N=64 或 128 的像素坐标，请根据实际调整。例如设置在左上角的 [10, 10] 位置）
-        breach_xy: tuple[float, float] | None = (10.0, 10.0), 
+        breach_xy: tuple[float, float] | None = (10.0, 10.0),
 
         # directional flooding
-        flow_dir_xy: tuple[float, float] = (1.0, 1.0),   
+        flow_dir_xy: tuple[float, float] = (1.0, 1.0),
         dir_bias_strength: float = 30.0,                 # 大幅减小此值，防止距离场数学畸变
-        dir_front_gain: float = 0.75,                   
+        dir_front_gain: float = 0.75,
     ):
         super().__init__(N=N)
+
+        if not PHIFLOW_AVAILABLE:
+            raise ImportError("Please install phiflow, e.g. `pip install phiflow`.")
 
         self.image_path = image_path or DEFAULT_IMAGE_PATH
         self.water_mask_path = water_mask_path or DEFAULT_WATER_MASK_PATH
@@ -162,7 +191,7 @@ class FloodFlow(BaseFlow):
         for p in [self.image_path, self.water_mask_path, self.region_mask_path]:
             assert os.path.exists(p), f"Missing file: {p}"
         if self.solid_mask_path is not None:
-            assert os.path.exists(self.solid_mask_path), f"Missing file: {p}"
+            assert os.path.exists(self.solid_mask_path), f"Missing file: {self.solid_mask_path}"  # 修复
 
         self.level_start = float(level_start)
         self.level_end = float(level_end)
@@ -176,28 +205,23 @@ class FloodFlow(BaseFlow):
         self.front_ring_outer_ratio = float(front_ring_outer_ratio)
         self.front_motion_suppress = float(front_motion_suppress)
 
-        self.downstream_x_px = float(downstream_x_px)
-        self.downstream_y_px = float(downstream_y_px)
-        self.curl_px = float(curl_px)
-        self.sway_px = float(sway_px)
-        self.edge_slow_pow = float(edge_slow_pow)
+        self.dt = float(dt)
+        self.gravity_x = float(gravity_x)
+        self.gravity_y = float(gravity_y)
+        self.viscosity = float(viscosity)
+        self.inflow_rate = float(inflow_rate)
+        self.water_diffusion = float(water_diffusion)
         self.max_disp_px = float(max_disp_px)
 
         self.adv_dilate = int(adv_dilate)
         self.source_guard_dilate = int(source_guard_dilate)
         self.solid_damping = float(solid_damping)
 
-        self.noise_seed = int(noise_seed)
-        self.noise_smooth_k = int(noise_smooth_k)
-        self.noise_smooth_iters = int(noise_smooth_iters)
-
         self.water0 = _load_mask_png(self.water_mask_path, N)
         self.region = _load_mask_png(self.region_mask_path, N)
         self.land = (1.0 - self.water0).clamp(0.0, 1.0)
 
         self.solid = None
-        if self.solid_mask_path is not None:
-            self.solid = _load_mask_png(self.solid_mask_path, N)
 
         if breach_xy is None:
             cx, cy = _compute_mask_centroid_xy(self.water0)
@@ -253,7 +277,7 @@ class FloodFlow(BaseFlow):
         dist = self.dist_map.to(device)
         dir_bias = self.dir_bias.to(device)
         # 关键：右下方向距离更“短”，所以更容易蔓延过去
-        eff = dist - self.seed_radius - 1.6*dir_bias
+        eff = dist - self.seed_radius - 1.6 * dir_bias
         return eff.clamp(min=0.0)
 
     def get_spatial_eta(self, t: int):
@@ -291,9 +315,48 @@ class FloodFlow(BaseFlow):
             seq.append(hard[None, None, ...].clone())
         return seq
 
-    def _precompute_grids(self):
-        torch.manual_seed(self.noise_seed)
+    def _simulate_phiflow_velocity(self):
+        N = self.N
+        domain = Box(x=N, y=N)
 
+        water = _torch_mask_to_phi_grid(self.water0[0, 0], domain)
+        velocity = StaggeredGrid(0, 0, domain, x=N, y=N)
+        pressure = None
+
+        trajectories = []
+
+        for t in range(self.T):
+            flood_t = self.flood_seq[t][0, 0]
+            flood_grid = _torch_mask_to_phi_grid(flood_t, domain)
+
+            water = advect.mac_cormack(water, velocity, dt=self.dt)
+            if self.water_diffusion > 0:
+                water = diffuse.explicit(water, self.water_diffusion, self.dt)
+
+            # 修复：Field 级��最大值，不能用 math.maximum(Field, Field)
+            water = field.maximum(water, flood_grid * self.inflow_rate)
+
+            gravity = resample(water * (self.gravity_y, self.gravity_x), to=velocity)
+
+            velocity = advect.semi_lagrangian(velocity, velocity, dt=self.dt)
+            if self.viscosity > 0:
+                velocity = diffuse.explicit(velocity, self.viscosity, self.dt)
+            velocity = velocity + gravity * self.dt
+
+            velocity, pressure = fluid.make_incompressible(
+                velocity,
+                (),
+                Solve(x0=pressure, rank_deficiency=0)
+            )
+
+            velocity_center = velocity.at_centers()
+            vel_native = velocity_center.values.native("y,x,vector")
+            vel_torch = torch.as_tensor(vel_native, dtype=torch.float32).cpu()
+            trajectories.append(vel_torch)
+
+        return trajectories
+
+    def _precompute_grids(self):
         N = self.N
         XY = self.XY.float()
         device = XY.device
@@ -303,74 +366,34 @@ class FloodFlow(BaseFlow):
         if self.solid is not None:
             solid_2d = self.solid[0, 0].to(device)
 
-        dist_eff = self._dist_eff(device)
-
-        noise_a = torch.randn(1, 1, N, N, device=device)
-        noise_b = torch.randn(1, 1, N, N, device=device)
-        noise_a = _smooth_noise(noise_a, self.noise_smooth_k, self.noise_smooth_iters)
-        noise_b = _smooth_noise(noise_b, self.noise_smooth_k, self.noise_smooth_iters)
+        sim_velocities = self._simulate_phiflow_velocity()
 
         for t in range(self.T):
-            s = float(t) / float(max(1, self.T - 1))
-            n = (1.0 - s) * noise_a + s * noise_b
-
-            n_pad = F.pad(n, (1, 1, 1, 1), mode="reflect")
-            gx = (n_pad[:, :, 1:-1, 2:] - n_pad[:, :, 1:-1, :-2]) * 0.5
-            gy = (n_pad[:, :, 2:, 1:-1] - n_pad[:, :, :-2, 1:-1]) * 0.5
-
-            dx = self.downstream_x_px + self.sway_px * n + self.curl_px * gx
-            dy = self.downstream_y_px + self.curl_px * gy
-            dx = dx[0, 0]
-            dy = dy[0, 0]
+            dx = sim_velocities[t][..., 1].to(device)
+            dy = sim_velocities[t][..., 0].to(device)
 
             eta = self.get_spatial_eta(t)[0, 0]
-            level = self._level_at(t)
-
-            front_ring = _make_transition_ring(
-                dist_eff,
-                level=level,
-                ring_inner_ratio=self.front_ring_inner_ratio,
-                ring_outer_ratio=self.front_ring_outer_ratio,
-                band=self.eta_band,
-            )
-
-            core = (eta > 0.7).float() * eta
-            frontier = front_ring * (0.45 + 0.55 * eta)
-            adv = frontier + 0.22 * core
-            adv = adv.clamp(0.0, 1.0).pow(self.edge_slow_pow)
-
-            ring_suppress = (1.0 - self.front_motion_suppress * front_ring).clamp(0.0, 1.0)
-            adv = adv * ring_suppress
-
             flooded_hard = self.flood_seq[t].to(device)
             adv_mask = _dilate(flooded_hard, self.adv_dilate)[0, 0]
             soft_near = _dilate((eta[None, None, ...] > 0.04).float(), 5)[0, 0]
-            move_mask = torch.maximum(adv_mask, soft_near)
+            move_mask = torch.maximum(adv_mask, soft_near).clamp(0.0, 1.0)
 
-            # 进一步给右下方向增加前沿推进
-            dx = dx + self.dir_front_gain * front_ring
-            dy = dy + self.dir_front_gain * front_ring
-
-            dx = dx * adv * move_mask
-            dy = dy * adv * move_mask
-
-            # 不再完全消掉整体漂移，只去掉一部分
-            dx, dy = _partial_zero_mean_flow(dx, dy, move_mask, keep_ratio=0.75)
+            dx = dx * move_mask
+            dy = dy * move_mask
 
             if solid_2d is not None:
                 damping = (1.0 - self.solid_damping * solid_2d).clamp(0.0, 1.0)
                 dx = dx * damping
                 dy = dy * damping
 
-            disp = torch.sqrt(dx * dx + dy * dy + 1e-6)
-            scale = (self.max_disp_px / disp).clamp(max=1.0)
-            dx = dx * scale
-            dy = dy * scale
-
             flow = torch.stack([dx, dy], dim=-1)
+
+            speed = torch.norm(flow, dim=-1, keepdim=True) + 1e-6
+            scale = (self.max_disp_px / speed).clamp(max=1.0)
+            flow = flow * scale
+
             coords = XY - flow
 
-            # Source guard 放宽，不然前沿借不到纹理
             source_mask = torch.maximum(
                 _dilate(flooded_hard, self.source_guard_dilate)[0, 0],
                 (eta > 0.10).float(),
