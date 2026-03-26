@@ -105,6 +105,14 @@ class FireFlow(BaseFlow):
         source_guard_dilate: int = 1,
         fuel_velocity_damping: float = 1.0,
         smoke_threshold: float = 0.03,
+
+        # ---------- 火焰-烟雾耦合参数 ----------
+        fire_advect_factor: float = 0.5,
+        # 速度场驱动的火焰区域平流权重 (0=纯静态burn_seq, 1=纯速度场平流)
+        velocity_flame_coupling: float = 0.3,
+        # 局部流速对燃烧速率的影响强度 (0=禁用, 1=全耦合)
+        vorticity_strength: float = 0.0,
+        # 涡量约束强度，增强火焰卷曲运动 (0=禁用)
     ):
         super().__init__(N=N)
 
@@ -139,6 +147,10 @@ class FireFlow(BaseFlow):
         self.fuel_velocity_damping = float(fuel_velocity_damping)
         self.smoke_threshold = float(smoke_threshold)
 
+        self.fire_advect_factor = float(fire_advect_factor)
+        self.velocity_flame_coupling = float(velocity_flame_coupling)
+        self.vorticity_strength = float(vorticity_strength)
+
         fire0 = _load_mask_png(self.fire_mask_path, N)
         fuel = _load_mask_png(self.fuel_mask_path, N)
         if self.fuel_dilate > 0:
@@ -150,8 +162,9 @@ class FireFlow(BaseFlow):
         # 这里继续保留 burn_seq：
         # 它负责“哪里允许持续着火 / 重绘”，而真正的位移方向和速度来自 PhiFlow。
         self.burn_seq = self._precompute_burn()
-        self.precomputed_eta = self.burn_seq
-        self.precomputed_grids = self._precompute_grids()
+        # _precompute_grids 同时返回光流网格和 spatial-eta 序列，
+        # 当 fire_advect_factor > 0 时 eta 反映速度场驱动的动态火焰区域。
+        self.precomputed_grids, self.precomputed_eta = self._precompute_grids()
 
         self.pos_prompt = (
             "aerial view of buildings on fire, flames and hot smoke spreading between rooftops, "
@@ -194,13 +207,119 @@ class FireFlow(BaseFlow):
             burn_seq.append(region.clone())
         return burn_seq
 
+    def _advect_fire_region(self, fire_grid, velocity, domain, N):
+        """
+        使用与烟雾相同的速度场对火焰区域进行半拉格朗日平流。
+        确保火焰和烟雾受到同一物理力的约束，保持运动同步。
+
+        Args:
+            fire_grid: PhiFlow CenteredGrid，当前火焰区域（标量密度）
+            velocity: PhiFlow StaggeredGrid，当前速度场
+            domain: PhiFlow Box，计算域
+            N: 网格分辨率
+
+        Returns:
+            更新后的 PhiFlow CenteredGrid（火焰区域）
+        """
+        fire_advected = advect.semi_lagrangian(fire_grid, velocity, dt=self.dt)
+        # 平流后截断到 [0,1] 并重建网格，防止数值漂移累积
+        fire_np = fire_advected.values.native("y,x")
+        fire_clamped = torch.as_tensor(fire_np, dtype=torch.float32).cpu().clamp(0.0, 1.0)
+        return _torch_mask_to_phi_grid(fire_clamped, domain)
+
+    def _compute_adaptive_burn_rate(self, vel_mag: torch.Tensor) -> torch.Tensor:
+        """
+        根据局部速度大小计算自适应燃烧速率。
+        速度越大的区域燃烧越剧烈，模拟风驱动火焰的物理效果。
+
+        Args:
+            vel_mag: (H, W) 速度幅值张量
+
+        Returns:
+            (H, W) 自适应燃烧速率张量
+        """
+        # 将速度幅值归一化到 [0,1]，以 max_speed_px 为参考
+        normalized_speed = (vel_mag / (self.max_speed_px + 1e-6)).clamp(0.0, 1.0)
+        # 燃烧速率随局部速度线性增强
+        return self.inflow_rate * (1.0 + self.velocity_flame_coupling * normalized_speed)
+
+    def _apply_vorticity_confinement(self, velocity, domain, N):
+        """
+        计算涡量约束力并叠加到速度场，使火焰产生更真实的卷曲运动。
+
+        基于 Fedkiw et al. (2001) 的涡量约束方法：
+          ω  = ∂vy/∂x − ∂vx/∂y       （2D 标量涡量）
+          η  = ∇|ω|                    （涡量梯度）
+          N̂  = η / |η|                （归一化方向）
+          f  = ε × (N̂ × ω)           （约束力）
+
+        Args:
+            velocity: PhiFlow StaggeredGrid
+            domain: PhiFlow Box
+            N: 网格分辨率
+
+        Returns:
+            施加涡量约束后的 StaggeredGrid
+        """
+        vel_center = velocity.at_centers()
+        vel_native = vel_center.values.native("y,x,vector")
+        vel_t = torch.as_tensor(vel_native, dtype=torch.float32).cpu()
+
+        vx = vel_t[..., 0]  # (H, W)
+        vy = vel_t[..., 1]  # (H, W)
+
+        # 2D 涡量：ω = ∂vy/∂x − ∂vx/∂y（中心差分）
+        dvydx = torch.zeros_like(vy)
+        dvxdy = torch.zeros_like(vx)
+        dvydx[:, 1:-1] = (vy[:, 2:] - vy[:, :-2]) * 0.5
+        dvxdy[1:-1, :] = (vx[2:, :] - vx[:-2, :]) * 0.5
+        omega = dvydx - dvxdy
+
+        # 涡量幅值的梯度 η = ∇|ω|
+        omega_abs = omega.abs()
+        eta_x = torch.zeros_like(omega_abs)
+        eta_y = torch.zeros_like(omega_abs)
+        eta_x[:, 1:-1] = (omega_abs[:, 2:] - omega_abs[:, :-2]) * 0.5
+        eta_y[1:-1, :] = (omega_abs[2:, :] - omega_abs[:-2, :]) * 0.5
+
+        # 归一化方向 N̂
+        eta_mag = (eta_x ** 2 + eta_y ** 2).sqrt() + 1e-8
+        nx = eta_x / eta_mag
+        ny = eta_y / eta_mag
+
+        # 约束力：f_x = ε·ny·ω，f_y = −ε·nx·ω
+        fx = (self.vorticity_strength * ny * omega).numpy()
+        fy = (self.vorticity_strength * (-nx) * omega).numpy()
+
+        # 将约束力转为 PhiFlow CenteredGrid 并重采样到 StaggeredGrid
+        fx_grid = CenteredGrid(
+            math.tensor(fx, spatial("y,x")),
+            extrapolation.BOUNDARY, domain, x=N, y=N,
+        )
+        fy_grid = CenteredGrid(
+            math.tensor(fy, spatial("y,x")),
+            extrapolation.BOUNDARY, domain, x=N, y=N,
+        )
+        # 利用 PhiFlow 向量广播：scalar_grid * (cx, cy) → vector CenteredGrid
+        confinement = resample(
+            fx_grid * (1.0, 0.0) + fy_grid * (0.0, 1.0),
+            to=velocity,
+        )
+        return velocity + confinement * self.dt
+
     def _simulate_phiflow_velocity(self):
         """
-        用 PhiFlow 做一个二维 Eulerian smoke plume：
-        - smoke: 标量密度场
+        用 PhiFlow 做一个二维 Eulerian smoke plume，同时跟踪耦合的火焰区域状态：
+        - smoke: 标量烟密度场
+        - fire_region: 标量火焰密度场（与烟共享同一速度场平流）
         - velocity: StaggeredGrid 速度场
         - 每步做 advection -> diffusion -> buoyancy -> incompressibility
-        输出每帧中心采样后的速度场 (H, W, 2)，后面直接转成 optical flow 用。
+
+        当 fire_advect_factor > 0 时，火焰区域通过半拉格朗日平流随速度场移动，
+        与烟密度保持物理同步；当 velocity_flame_coupling > 0 时，燃烧速率由局部
+        速度幅值自适应调节；当 vorticity_strength > 0 时施加涡量约束增强火焰卷曲。
+
+        返回每帧的 (smoke_torch, vel_torch, fire_state_torch) 三元组列表。
         """
         N = self.N
         domain = Box(x=float(N), y=float(N))
@@ -209,19 +328,59 @@ class FireFlow(BaseFlow):
         velocity = StaggeredGrid(0, 0, domain, x=N, y=N)
         pressure = None
 
+        # 初始化耦合火焰区域（仅在 fire_advect_factor > 0 时使用）
+        fire_region = (_torch_mask_to_phi_grid(self.fire0[0, 0], domain)
+            if self.fire_advect_factor > 0 else None)
+
         trajectories = []
 
         for t in range(self.T):
-            burn_t = self.burn_seq[t][0, 0]
-            burn_grid = _torch_mask_to_phi_grid(burn_t, domain)
+            burn_t = self.burn_seq[t][0, 0]  # (N, N) 预计算燃烧区域
 
-            # 1) Advect / diffuse smoke density
+            # --- 获取当前步初始速度幅值（用于自适应燃烧速率）---
+            if self.velocity_flame_coupling > 0:
+                vel_c = velocity.at_centers()
+                vel_np = vel_c.values.native("y,x,vector")
+                vel_cur = torch.as_tensor(vel_np, dtype=torch.float32).cpu()
+                vel_mag = vel_cur.norm(dim=-1)  # (N, N)
+                adaptive_rate_2d = self._compute_adaptive_burn_rate(vel_mag)
+
+            # --- 火焰区域半拉格朗日平流（与烟同步移动）---
+            if self.fire_advect_factor > 0:
+                fire_region = self._advect_fire_region(fire_region, velocity, domain, N)
+
+                # 从 PhiFlow 网格提取平流后的火焰区域
+                fire_native = fire_region.values.native("y,x")
+                fire_torch = torch.as_tensor(fire_native, dtype=torch.float32).cpu()
+
+                # 混合：fire_advect_factor 控制速度平流 vs 预计算扩张的权重
+                blended_fire = (
+                    self.fire_advect_factor * fire_torch
+                    + (1.0 - self.fire_advect_factor) * burn_t
+                )
+                # 应用燃料约束并截断
+                blended_fire = (blended_fire * self.fuel[0, 0]).clamp(0.0, 1.0)
+
+                # 将混合结果写回 fire_region，参与下一帧平流
+                fire_region = _torch_mask_to_phi_grid(blended_fire, domain)
+                effective_burn_grid = fire_region
+                fire_state_t = blended_fire  # (N, N) tensor
+            else:
+                burn_grid = _torch_mask_to_phi_grid(burn_t, domain)
+                effective_burn_grid = burn_grid
+                fire_state_t = burn_t  # (N, N) tensor
+
+            # 1) 烟密度平流 / 扩散
             smoke = advect.mac_cormack(smoke, velocity, dt=self.dt)
             if self.smoke_diffusion > 0:
                 smoke = diffuse.explicit(smoke, self.smoke_diffusion, self.dt)
 
-            # 2) 持续在当前燃烧区注入密度，模拟持续火源
-            smoke = smoke * self.density_decay + self.inflow_rate * burn_grid
+            # 2) 在当前燃烧区注入密度（自适应或固定速率）
+            if self.velocity_flame_coupling > 0:
+                adaptive_rate_grid = _torch_mask_to_phi_grid(adaptive_rate_2d, domain)
+                smoke = smoke * self.density_decay + adaptive_rate_grid * effective_burn_grid
+            else:
+                smoke = smoke * self.density_decay + self.inflow_rate * effective_burn_grid
 
             # 3) 浮力 + 水平风
             #    y 负方向表示图像坐标中的“向上”
@@ -232,13 +391,18 @@ class FireFlow(BaseFlow):
             if self.viscosity > 0:
                 velocity = diffuse.explicit(velocity, self.viscosity, self.dt)
             velocity = velocity + buoyancy * self.dt
+
+            # 5) 可选涡量约束（增强火焰卷曲）
+            if self.vorticity_strength > 0:
+                velocity = self._apply_vorticity_confinement(velocity, domain, N)
+
             velocity, pressure = fluid.make_incompressible(
                 velocity,
                 (),
                 Solve(x0=pressure, rank_deficiency=0),
             )
 
-            # 5) 取中心采样，变成 (H, W, 2) 的 torch tensor
+            # 6) 取中心采样，变成 (H, W, 2) 的 torch tensor
             velocity_center = velocity.at_centers()
             vel_native = velocity_center.values.native("y,x,vector")
             vel_torch = torch.as_tensor(vel_native, dtype=torch.float32).cpu()
@@ -246,21 +410,41 @@ class FireFlow(BaseFlow):
             smoke_native = smoke.values.native("y,x")
             smoke_torch = torch.as_tensor(smoke_native, dtype=torch.float32).cpu()
 
-            trajectories.append((smoke_torch, vel_torch))
+            trajectories.append((smoke_torch, vel_torch, fire_state_t))
 
         return trajectories
 
     def _precompute_grids(self):
+        """
+        计算所有帧的采样网格（optical flow 映射表）并同时生成 spatial-eta 序列。
+
+        当 fire_advect_factor > 0 时，advection mask 及 eta 使用物理模拟驱动的
+        动态火焰区域，使光流掩码与底层速度场保持同步；否则回退到静态 burn_seq。
+
+        Returns:
+            grids: List[Tensor (N,N,2)]，每帧的归一化采样坐标
+            fire_states: List[Tensor (1,1,N,N)]，每帧的 spatial-eta 遮罩
+        """
         N = self.N
         XY = self.XY.float()
         fuel_2d = self.fuel[0, 0].float()
         grids = []
+        fire_states = []
 
         sim_traj = self._simulate_phiflow_velocity()
 
-        for t, (smoke_t, vel_t) in enumerate(sim_traj):
-            burn = self.burn_seq[t]
-            adv_mask = _dilate(burn, self.advect_dilate)[0, 0].float()
+        for t, (smoke_t, vel_t, fire_state_t) in enumerate(sim_traj):
+            # 选择 advection mask 来源：
+            #   fire_advect_factor > 0 → 使用速度场驱动的动态火焰区域
+            #   fire_advect_factor == 0 → 使用静态预计算 burn_seq（原始行为）
+            if self.fire_advect_factor > 0:
+                fire_4d = fire_state_t[None, None, ...]  # (1,1,N,N)
+                adv_mask = _dilate(fire_4d, self.advect_dilate)[0, 0].float()
+                fire_states.append(fire_4d)
+            else:
+                burn = self.burn_seq[t]
+                adv_mask = _dilate(burn, self.advect_dilate)[0, 0].float()
+                fire_states.append(burn)
 
             # ------------------------------
             # 物理模拟的 velocity field -> optical flow (pixel displacement)
@@ -297,4 +481,4 @@ class FireFlow(BaseFlow):
             grid[..., 1] = 2.0 * (grid[..., 1] / (N - 1.0)) - 1.0
             grids.append(grid)
 
-        return grids
+        return grids, fire_states
