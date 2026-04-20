@@ -10,6 +10,7 @@ from .new_car_flow import CarFlow
 from .smoke_flow import SmokeFlow
 from .fire_flow import FireFlow
 from .flood_flow import FloodFlow
+from .canal_flood_flow import CanalFloodFlow
 
 example_registry: Dict[str, Type[BaseFlow]] = {
     "earth": EarthFlow,
@@ -22,4 +23,5 @@ example_registry: Dict[str, Type[BaseFlow]] = {
     "smoke": SmokeFlow,
     "fire": FireFlow,
     "flood": FloodFlow,
+    "canal_flood": CanalFloodFlow,
 }

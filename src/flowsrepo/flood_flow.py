@@ -26,7 +26,7 @@ except ImportError:
 
 DEFAULT_IMAGE_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_scene.png"
 DEFAULT_WATER_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_2.png"
-DEFAULT_REGION_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_region_1.png"
+DEFAULT_REGION_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/water_region_0.png"
 DEFAULT_SOLID_MASK_PATH = "/home/yangdonglin/MotionCraft/src/flowsrepo/data/water/solid_mask.png"
 
 
@@ -138,7 +138,7 @@ class FloodFlow(BaseFlow):
         water_mask_path: str = None,
         region_mask_path: str = None,
         solid_mask_path: str = None,
-        T: int = 24,
+        T: int = 36,
 
         # flooding
         level_start: float = 20.0,

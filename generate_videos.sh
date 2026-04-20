@@ -11,7 +11,7 @@ export CUDA_VISIBLE_DEVICES=6
 # done
 
 # LatentSpace Experiments
-for example in "flood"
+for example in "canal_flood"
 do
    #python clip_maker_latent.py --example $example --tag "MotionCraft_nearest" --interpolationmode "nearest" 
    python clip_maker_latent.py --example $example --tag "MotionCraft_bilinear" --interpolationmode "bilinear" 
